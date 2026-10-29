@@ -18,6 +18,40 @@ const CLIENT = fileURLToPath(new URL('../lib/client.js', import.meta.url))
 /** Cache-buster: every load must re-execute the bundle in a fresh module. */
 let run = 0
 
+/** What the host handoff route answers on the next call. */
+let handoff = { status: 200, body: { ok: true, text: 'the answer', turn: 0 } }
+
+/** Every handoff URL the bundle asked for. */
+let handoffs = []
+
+/** localStorage entries the next load should find already written. */
+let seedStorage = undefined
+
+/**
+ * Reset the browser-ish globals a fresh load installs.
+ * @returns {{storage: Map<string, string>}} the shared localStorage backing map.
+ */
+function installBrowserStubs() {
+  const storage = new Map()
+  globalThis.localStorage = {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: (key) => storage.delete(key),
+  }
+  handoffs = []
+  globalThis.fetch = async (url) => {
+    handoffs.push(url)
+    return {
+      ok: handoff.status < 400,
+      status: handoff.status,
+      async json() {
+        return handoff.body
+      },
+    }
+  }
+  return { storage }
+}
+
 /**
  * Load the bundle and return its plugin exports.
  * @returns {Promise<{apply: Function, inject: string[], loads: object[], ctx: object}>}
@@ -25,6 +59,11 @@ let run = 0
 async function loadPlugin() {
   const source = await readFile(CLIENT, 'utf8')
   const loads = []
+  const { storage } = installBrowserStubs()
+  if (seedStorage !== undefined) {
+    for (const [key, value] of Object.entries(seedStorage)) storage.set(key, value)
+    seedStorage = undefined
+  }
   globalThis.window = { __ModuleLoader__: { load: (definition) => loads.push(definition) } }
   globalThis.document = {
     getElementById: () => null,
@@ -57,7 +96,7 @@ async function loadPlugin() {
 
   const state = createContext()
   plugin.apply(state.ctx)
-  return { ...plugin, loads, ctx: state }
+  return { ...plugin, loads, ctx: state, storage }
 }
 
 /**
@@ -70,6 +109,9 @@ function createContext() {
     openResource: [],
     retain: [],
     release: [],
+    binding: [],
+    draft: [],
+    prompt: [],
   }
   const state = {
     calls,
@@ -78,11 +120,19 @@ function createContext() {
     slots: [],
     dictionaries: undefined,
     styleMounted: false,
+    services: {},
+    bindings: {},
+    summaries: {},
+    draftResult: 'applied',
+    promptResult: { ok: true, value: { accepted: true } },
   }
   let nextId = 0
   const ctx = {
     effect(fn, _label) {
       return fn()
+    },
+    get(name) {
+      return state.services[name]
     },
     locale: {
       register(namespace, dictionaries) {
@@ -120,6 +170,10 @@ function createContext() {
       },
     },
     sessions: {
+      list: {
+        getSnapshot: () => ({ byId: state.summaries }),
+        subscribe: () => () => {},
+      },
       async fork(options) {
         calls.fork.push(options)
         nextId += 1
@@ -134,10 +188,53 @@ function createContext() {
           },
         }
       },
+      binding(id) {
+        calls.binding.push(id)
+        return state.bindings[id]
+      },
+      async using(target, options, operation) {
+        return operation({
+          sessionId: target,
+          options,
+          binding: {
+            session: {
+              async prompt(content, mode) {
+                calls.prompt.push({ target, content, mode })
+                return state.promptResult
+              },
+            },
+          },
+        })
+      },
     },
   }
   state.ctx = ctx
   return state
+}
+
+/**
+ * Install a stand-in `conversation` service whose draft accepts (or refuses) text.
+ * @param {object} state - fake context state.
+ * @returns {object} the recording draft sink.
+ */
+function installConversation(state) {
+  const sink = { drafts: [], notices: [] }
+  state.services.conversation = {
+    input: {
+      for() {
+        return {
+          notify(level, text) {
+            sink.notices.push({ level, text })
+          },
+        }
+      },
+      requestDraftInitialization(binding, options) {
+        sink.drafts.push({ binding, options })
+        return state.draftResult
+      },
+    },
+  }
+  return sink
 }
 
 /**
@@ -176,6 +273,7 @@ test('registers one resource protocol, one tab kind, and one turn-footer entry',
   assert.deepEqual(pane.definition.children, {
     'sidechat.conversation': { kind: 'single', scope: 'session' },
   })
+
 })
 
 test('accepts only its own addresses', async () => {
@@ -194,9 +292,10 @@ test('forking a turn opens a sidebar resource and never a workspace session', as
   const definition = turnTail(ctx)
 
   const injected = definition.inject('session-parent')
-  assert.equal(typeof injected.openSideChat, 'function')
+  assert.equal(injected.mode, 'open')
+  assert.equal(typeof injected.run, 'function')
 
-  const childId = await injected.openSideChat(42)
+  const childId = await injected.run(42)
 
   assert.deepEqual(ctx.calls.fork, [
     { sessionId: 'session-parent', atSeq: 42, increaseTitle: false },
@@ -208,6 +307,112 @@ test('forking a turn opens a sidebar resource and never a workspace session', as
     `dsh-resource://sidechat/session/${encodeURIComponent(childId)}?parent=session-parent&at=42`,
   )
   assert.equal(childId, 'session-child-1')
+})
+
+test('carry-back quotes only the highlighted passage when there is one', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(5)
+  handoff = { status: 200, body: { ok: true, text: 'a long answer\nwith several lines', turn: 0 } }
+  globalThis.getSelection = () => ({ toString: () => '  with several lines  ' })
+
+  try {
+    const result = await turnTail(ctx).inject(childId).run(0)
+    assert.equal(result, 'drafted')
+    assert.equal(
+      sink.drafts[0].options.prompt,
+      '侧聊里引用的内容：\n\nwith several lines',
+    )
+    assert.doesNotMatch(sink.drafts[0].options.prompt, /a long answer/)
+  } finally {
+    delete globalThis.getSelection
+  }
+})
+
+test('carry-back falls back to the whole answer without a selection', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(5)
+  handoff = { status: 200, body: { ok: true, text: 'the whole answer', turn: 0 } }
+  globalThis.getSelection = () => ({ toString: () => '   ' })
+
+  try {
+    await turnTail(ctx).inject(childId).run(0)
+    assert.equal(sink.drafts[0].options.prompt, '侧聊的结论：\n\nthe whole answer')
+  } finally {
+    delete globalThis.getSelection
+  }
+})
+
+test('a side chat offers carry-back from its own turns, across a reload', async () => {
+  const first = await loadPlugin()
+  const childId = await turnTail(first.ctx).inject('session-parent').run(7)
+  assert.equal(turnTail(first.ctx).inject(childId).mode, 'carry')
+
+  // A page reload rebuilds the plugin from storage alone.
+  seedStorage = { 'dsh.side-chat.v1': first.storage.get('dsh.side-chat.v1') }
+  const reloaded = await loadPlugin()
+  const injected = turnTail(reloaded.ctx).inject(childId)
+  assert.equal(injected.mode, 'carry')
+  assert.equal(turnTail(reloaded.ctx).inject('session-unrelated').mode, 'open')
+})
+
+test('carry-back puts the answer in the main composer instead of speaking for the user', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  handoff = { status: 200, body: { ok: true, text: '  use a Map, not an array  ', turn: 2 } }
+
+  const result = await turnTail(ctx).inject(childId).run(0)
+
+  assert.equal(result, 'drafted')
+  assert.deepEqual(handoffs, [`/side-chat/handoff?child=${encodeURIComponent(childId)}`])
+  assert.equal(sink.drafts.length, 1)
+  assert.equal(sink.drafts[0].binding, ctx.bindings['session-parent'])
+  assert.equal(sink.drafts[0].options.clearPreviousDraft, false)
+  assert.match(sink.drafts[0].options.prompt, /^侧聊的结论：/)
+  assert.match(sink.drafts[0].options.prompt, /use a Map, not an array/)
+  assert.deepEqual(ctx.calls.prompt, [])
+})
+
+test('carry-back sends a message when the composer cannot take the draft', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.draftResult = 'preserved'
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  handoff = { status: 200, body: { ok: true, text: 'conclusion', turn: 0 } }
+
+  const result = await turnTail(ctx).inject(childId).run(0)
+
+  assert.equal(result, 'sent')
+  assert.equal(sink.drafts.length, 1, 'the draft is still offered first')
+  assert.equal(ctx.calls.prompt.length, 1)
+  assert.equal(ctx.calls.prompt[0].target, 'session-parent')
+  assert.equal(ctx.calls.prompt[0].mode, 'queue')
+  assert.deepEqual(ctx.calls.prompt[0].content, [
+    { type: 'text', text: '侧聊的结论：\n\nconclusion' },
+  ])
+})
+
+test('carry-back reports an empty side chat instead of drafting nothing', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  handoff = { status: 200, body: { ok: true, text: '   ', turn: null } }
+
+  await assert.rejects(turnTail(ctx).inject(childId).run(0), /no answer yet/)
+  assert.equal(sink.drafts.length, 0)
+  assert.deepEqual(ctx.calls.prompt, [])
 })
 
 test('the resource provider retains the child for the tab lifetime and releases it', async () => {
