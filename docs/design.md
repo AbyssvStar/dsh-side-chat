@@ -469,3 +469,52 @@ MVP 合计约 3–4 人天（不含打磨与 i18n）。
 | 分叉点 | `atSeq`，通常是一个已完成 turn 的 closing seq |
 | 带回 | 把侧聊结论显式写入主线日志的动作 |
 | 引用 | 把一段选中文本带进另一侧输入框的动作 |
+
+---
+
+## 附录 B：实现修订（以代码为准）
+
+初版设计里的两处假设在动手后被运行时否决，实现按下面的方式落地；本文正文
+保留原样，用来记录当时为什么那样想。
+
+### B.1 「带回」不再写自定义事件
+
+原计划把结论写成 `sidechat/result` 事件追加到主线日志尾部。**仓库外插件做不到
+这件事**：`session.append` 在内存里不校验类型，但 `dsh-session-persistence` 的
+`validateStoredEvents` 在回读时会拒绝整个日志（`unknown to this harness and not
+marked ignorable`）；`ignorable: true` 只能经 `appendPluginRecord` 写入，而
+README 明确禁止仓库外插件调用，且这类记录永不进入模型可见面。
+`registerMessageProjection` 受同一份已知类型表约束。
+
+现在的通道：host 半部提供只读路由 `GET /side-chat/handoff?child=<sessionId>`，
+经 `sessionPersistence` 读出该侧聊最后一条助手正文；客户端把它放进父会话的
+草稿（`requestDraftInitialization`），草稿被拒时降级为一条普通用户消息
+（`session/prompt`）。副作用是「带回」不再有可渲染的专属卡片，改成草稿里的
+一段带标题文字。
+
+### B.2 侧聊无法从会话列表隐藏
+
+`sessionVisible`（`dsh-client-ui-workspace`）只隐藏 `origin === 'subagent'` 与
+非当前的空会话；没有隐藏标志，也没有 `origin: 'fork'`。归档会让
+`ArchivedSessionGate` 拒绝后续每一个 `agent/pre-step`，会话就不能再跑了；
+把 origin 改成 subagent 则 `session/prompt` 一律 `session/agent-busy`，UI 还会
+换成只读输入框。用户已确认接受现状：侧聊以 `depth: 1` 缩进挂在父会话下面。
+
+### B.3 里程碑状态
+
+| 项 | 状态 |
+| --- | --- |
+| M1 从任意 turn 开侧聊 | 已实现（turn 尾部按钮，`atSeq` = closing seq） |
+| M2 右栏全功能 Chat | 已实现（`conversation.content` 的 embedded 变体） |
+| M3 侧聊身份 | 已实现（标题 + tab 类型 + 地址携带 `parent`/`at`） |
+| M4 带回 | 已实现（草稿优先，失败降级为消息；正文见 B.1） |
+| M5 异步角标 | 已实现（标题座位跟随 `sessions.list`，运行中脉冲） |
+| M6 结束即归档 | 不实现（归档会让会话不可再跑，见 B.2） |
+| M7 选区引用 | 部分实现：带回时只带选中文字；反方向（选区注入侧聊输入框）待做 |
+
+### B.4 仍然依赖未验证的假设
+
+- `sidebar.right.pane.tab.title` 的 `inject` 返回值会与标准 props 合并——与
+  `conversation.chat.turnTail` 的用法一致，但只在桩运行时里验证过。
+- `sessions.list` 的 `getSnapshot()` / `subscribe()` 形态取自内置包的用法。
+- 真实浏览器里的观感（按钮位置、草稿是否真的出现）尚未由人确认。
