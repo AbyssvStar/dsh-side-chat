@@ -1,0 +1,11 @@
+# dsh-side-chat bundle patch.
+#
+# One host row. The host half is deliberately thin: it only carries the
+# package into the Loader so that `dsh.client` (in package.json) puts the
+# browser half into the boot graph. Everything the feature does — forking a
+# turn, the right-sidebar tab, bringing a conclusion back — lives in the
+# client half, except what only the Host may do (see lib/index.js).
+
+- insert:
+    - id: side-chat
+      name: 'dsh-side-chat'
