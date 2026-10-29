@@ -82,6 +82,7 @@ async function loadPlugin() {
     useState: (value) => [value, () => {}],
     useCallback: (fn) => fn,
     useEffect: () => {},
+    useSyncExternalStore: (_subscribe, read) => read(),
     createElement: () => null,
   }
   const jsxRuntime = { jsx: () => null, jsxs: () => null, Fragment: 'Fragment' }
@@ -265,6 +266,7 @@ test('registers one resource protocol, one tab kind, and one turn-footer entry',
   assert.deepEqual(definitions.sort(), [
     'conversation.chat.turnTail',
     'sidebar.right.pane.tab',
+    'sidebar.right.pane.tab.title',
     'sidechat.conversation',
   ])
 
@@ -274,6 +276,9 @@ test('registers one resource protocol, one tab kind, and one turn-footer entry',
     'sidechat.conversation': { kind: 'single', scope: 'session' },
   })
 
+  const title = state.slots.find((slot) => slot.definition.name === 'sidebar.right.pane.tab.title')
+  assert.equal(title.definition.key, 'dsh-side-chat', 'the chip dispatches by the same key')
+  assert.equal(title.definition.inject().sessions, state.ctx.sessions)
 })
 
 test('accepts only its own addresses', async () => {
