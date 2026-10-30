@@ -21,8 +21,14 @@ let run = 0
 /** What the host handoff route answers on the next call. */
 let handoff = { status: 200, body: { ok: true, text: 'the answer', turn: 0 } }
 
+/** What the host context route answers on the next call. */
+let context = { status: 200, body: { ok: true, sessionId: 'session-parent' } }
+
 /** Every handoff URL the bundle asked for. */
 let handoffs = []
+
+/** Every request the bundle made, with its init. */
+let requests = []
 
 /** localStorage entries the next load should find already written. */
 let seedStorage = undefined
@@ -39,13 +45,17 @@ function installBrowserStubs() {
     removeItem: (key) => storage.delete(key),
   }
   handoffs = []
-  globalThis.fetch = async (url) => {
-    handoffs.push(url)
+  requests = []
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    requests.push({ url: target, init })
+    if (target.startsWith('/side-chat/handoff')) handoffs.push(target)
+    const reply = target.startsWith('/side-chat/context') ? context : handoff
     return {
-      ok: handoff.status < 400,
-      status: handoff.status,
+      ok: reply.status < 400,
+      status: reply.status,
       async json() {
-        return handoff.body
+        return reply.body
       },
     }
   }
@@ -418,6 +428,47 @@ test('carry-back reports an empty side chat instead of drafting nothing', async 
   await assert.rejects(turnTail(ctx).inject(childId).run(0), /no answer yet/)
   assert.equal(sink.drafts.length, 0)
   assert.deepEqual(ctx.calls.prompt, [])
+})
+
+test('shift carry-back queues the conclusion as main-line context', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  handoff = { status: 200, body: { ok: true, text: 'use a Map, not an array', turn: 2 } }
+  context = { status: 200, body: { ok: true, sessionId: 'session-parent' } }
+
+  const result = await turnTail(ctx).inject(childId).run(0, { inject: true })
+
+  assert.equal(result, 'injected')
+  const post = requests.find((request) => request.url === '/side-chat/context')
+  assert.ok(post, 'the context route should be called')
+  assert.equal(post.init.method, 'POST')
+  assert.equal(post.init.credentials, 'same-origin')
+  assert.equal(post.init.headers['Content-Type'], 'application/json')
+  assert.deepEqual(JSON.parse(post.init.body), {
+    sessionId: 'session-parent',
+    text: '侧聊的结论：\n\nuse a Map, not an array',
+  })
+  assert.equal(sink.drafts.length, 0, 'context needs no composer')
+  assert.deepEqual(ctx.calls.prompt, [])
+})
+
+test('a cold main line falls back from context to the composer draft', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  handoff = { status: 200, body: { ok: true, text: 'conclusion', turn: 0 } }
+  context = { status: 409, body: { ok: false, error: 'the session is not live; use the draft instead' } }
+
+  const result = await turnTail(ctx).inject(childId).run(0, { inject: true })
+
+  assert.equal(result, 'drafted')
+  assert.equal(sink.drafts.length, 1)
+  assert.match(sink.drafts[0].options.prompt, /conclusion/)
 })
 
 test('the resource provider retains the child for the tab lifetime and releases it', async () => {

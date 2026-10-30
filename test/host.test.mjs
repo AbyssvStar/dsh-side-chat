@@ -1,12 +1,14 @@
 /**
- * Contract tests for the host half: the handoff route and the log scan behind it.
+ * Contract tests for both host routes — reading a side chat's answer, and
+ * queueing a note on the main line's context — plus the log scan behind them.
  *
- * The route is the only thing a browser cannot do for itself, so it is worth
- * pinning: which verb, which path, which failures, and what a stored log has to
- * look like before we hand its prose to the composer.
+ * These routes are the only things a browser cannot do for itself, so they are
+ * worth pinning: which verb, which path, which failures, and what a stored log
+ * has to look like before we hand its prose to the composer.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { Readable } from 'node:stream'
 import { apply, lastAnswer, name } from '../lib/index.js'
 
 /**
@@ -54,17 +56,22 @@ function createResponse() {
 }
 
 /**
- * Drive the registered route once.
+ * Drive one registered route once.
  * @param {{ routes: object[], ctx: object }} harness - context with its routes.
- * @param {{ method?: string, url: string }} request - what the browser sends.
+ * @param {{ method?: string, url: string, body?: string, path?: string }} request - what the browser sends.
  * @returns {Promise<{ status: number, json: any, headers: object }>} the reply.
  */
 async function call(harness, request) {
   apply(harness.ctx)
-  const [route] = harness.routes
-  assert.ok(route, 'the handoff route should be registered')
+  const path = request.path ?? '/side-chat/handoff'
+  const route = harness.routes.find((candidate) => candidate.path === path)
+  assert.ok(route, `the ${path} route should be registered`)
   const response = createResponse()
-  await route.handler({ method: request.method ?? 'GET', url: request.url }, response)
+  const base = { method: request.method ?? 'GET', url: request.url }
+  const req = request.body === undefined
+    ? base
+    : Object.assign(Readable.from([Buffer.from(request.body, 'utf8')]), base)
+  await route.handler(req, response)
   // The route hands off to an async handler without returning it; let it settle.
   for (let ticks = 0; ticks < 50 && response.body === ''; ticks += 1) {
     await new Promise((resolve) => setImmediate(resolve))
@@ -90,16 +97,19 @@ function logWith(text, turn) {
   ]
 }
 
-test('registers an exact GET route only when a webserver exists', () => {
+test('registers both exact routes, and only when a webserver exists', () => {
   const bare = withWebServer()
   apply({ get: () => undefined, effect: (factory) => factory() })
   assert.equal(bare.routes.length, 0)
 
   apply(bare.ctx)
-  assert.equal(bare.routes.length, 1)
-  assert.equal(bare.routes[0].kind, 'exact')
-  assert.equal(bare.routes[0].path, '/side-chat/handoff')
-  assert.equal(typeof bare.routes[0].handler, 'function')
+  assert.deepEqual(
+    bare.routes.map((route) => [route.kind, route.path, typeof route.handler]),
+    [
+      ['exact', '/side-chat/handoff', 'function'],
+      ['exact', '/side-chat/context', 'function'],
+    ],
+  )
 })
 
 test('rejects a non-GET request without touching persistence', async () => {
@@ -223,6 +233,115 @@ test('lastAnswer prefers the newest prose and skips tool-only messages', () => {
 test('lastAnswer tolerates junk and finds nothing in an empty log', () => {
   assert.equal(lastAnswer([]), undefined)
   assert.equal(lastAnswer([null, {}, { type: 'assistant/message', data: null }, { type: 'assistant/message', data: { message: { content: 'nope' } } }]), undefined)
+})
+
+/**
+ * Build a host context that also has an agent registry.
+ * @param {(sessionId: string) => object | undefined} lookup - what `agents.get` answers.
+ * @returns {{ ctx: object, routes: object[], injected: object[] }} harness.
+ */
+function withAgents(lookup) {
+  const harness = withWebServer()
+  const injected = []
+  const registry = {
+    get(sessionId) {
+      const agent = lookup(sessionId)
+      if (agent === undefined) return undefined
+      return {
+        inject(message) {
+          injected.push(message)
+          if (typeof agent.onInject === 'function') agent.onInject(message)
+        },
+      }
+    },
+  }
+  const inner = harness.ctx.get
+  harness.ctx.get = (serviceName) => (serviceName === 'agents' ? registry : inner(serviceName))
+  return { ...harness, injected }
+}
+
+test('the context route rejects a non-POST request', async () => {
+  const harness = withAgents(() => ({}))
+  const reply = await call(harness, { method: 'GET', url: '/side-chat/context', path: '/side-chat/context' })
+  assert.equal(reply.status, 405)
+  assert.equal(reply.json.ok, false)
+})
+
+test('the context route rejects a malformed body, session, or text', async () => {
+  const harness = withAgents(() => ({}))
+  const send = (body) => call(harness, { method: 'POST', url: '/side-chat/context', path: '/side-chat/context', body })
+
+  assert.equal((await send('not json')).status, 400)
+  assert.equal((await send(JSON.stringify({ sessionId: '../etc/passwd', text: 'hi' }))).status, 400)
+  assert.equal((await send(JSON.stringify({ sessionId: 'session-main' }))).status, 400)
+  assert.equal((await send(JSON.stringify({ sessionId: 'session-main', text: '   ' }))).status, 400)
+  assert.equal(harness.injected.length, 0)
+})
+
+test('the context route refuses an oversized body before parsing it', async () => {
+  const harness = withAgents(() => ({}))
+  const huge = JSON.stringify({ sessionId: 'session-main', text: 'x'.repeat(60000) })
+  const reply = await call(harness, { method: 'POST', url: '/side-chat/context', path: '/side-chat/context', body: huge })
+  assert.equal(reply.status, 400)
+  assert.match(reply.json.error, /too large/)
+})
+
+test('the context route degrades when the agent registry or the agent is missing', async () => {
+  const registryGone = withWebServer()
+  const noRegistry = await call(registryGone, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    body: JSON.stringify({ sessionId: 'session-main', text: 'note' }),
+  })
+  assert.equal(noRegistry.status, 503)
+  assert.match(noRegistry.json.error, /agent registry/)
+
+  const cold = withAgents(() => undefined)
+  const notLive = await call(cold, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    body: JSON.stringify({ sessionId: 'session-main', text: 'note' }),
+  })
+  assert.equal(notLive.status, 409)
+  assert.match(notLive.json.error, /not live/)
+})
+
+test('the context route queues the note as plugin-sourced user context', async () => {
+  const harness = withAgents((sessionId) => (sessionId === 'session-main' ? {} : undefined))
+  const reply = await call(harness, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    body: JSON.stringify({ sessionId: 'session-main', text: 'use a Map, not an array' }),
+  })
+
+  assert.equal(reply.status, 200)
+  assert.deepEqual(reply.json, { ok: true, sessionId: 'session-main' })
+  assert.equal(harness.injected.length, 1)
+  const [message] = harness.injected
+  assert.equal(message.role, 'user')
+  assert.deepEqual(message.source, { kind: 'side-chat' })
+  assert.deepEqual(message.content, [{ type: 'text', text: 'use a Map, not an array' }])
+  assert.equal(typeof message.id, 'string')
+  assert.ok(message.id.length > 0)
+})
+
+test('the context route reports a failing inject as a server error', async () => {
+  const harness = withAgents(() => ({
+    onInject() {
+      throw new Error('agent is disposing')
+    },
+  }))
+  const reply = await call(harness, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    body: JSON.stringify({ sessionId: 'session-main', text: 'note' }),
+  })
+  assert.equal(reply.status, 500)
+  assert.match(reply.json.error, /disposing/)
 })
 
 test('the plugin announces a name', () => {

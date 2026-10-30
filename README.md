@@ -19,6 +19,10 @@ side chat can explore a bad idea without touching the main line.
   into the parent's composer as a draft. You see it, edit it, and decide when
   to send. If the composer cannot take it, the note is sent as a user message
   instead — the only other channel the model can see.
+- **Carry back as background.** `Shift`-click `↩` instead queues the same text
+  as model-facing context on the main line: the next turn can see it, nothing
+  is woken, and the plugin never speaks in your voice. The chat view already
+  renders plugin-sourced context as a context line rather than a bubble.
 - **Quote, don't dump.** Select text before pressing `↩` and only the selection
   is carried back, not the whole answer.
 - **The chip tells the truth.** A side chat often keeps running while you work
@@ -43,6 +47,13 @@ the model. So the browser half asks the host half for the child's last answer
 over `GET /side-chat/handoff?child=<sessionId>`, and the host half reads the
 stored log through `sessionPersistence` — read-only, one route, no new
 dependencies.
+
+The context carrier goes the other way, over `POST /side-chat/context`, because
+only the host can reach a live agent: `agent.inject()` persists an ordinary
+`user/message` whose `source.kind` is `side-chat`. That is a known event type, so
+the log stays readable, and it reaches the model without impersonating the user.
+If the parent session is cold, the host answers `409` and the browser falls back
+to the draft.
 
 ## Known limits
 
