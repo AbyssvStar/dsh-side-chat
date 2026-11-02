@@ -25,6 +25,10 @@ side chat can explore a bad idea without touching the main line.
   renders plugin-sourced context as a context line rather than a bubble.
 - **Quote, don't dump.** Select text before pressing `↩` and only the selection
   is carried back, not the whole answer.
+- **Send a passage the other way.** Select text anywhere in the page — a main-line
+  answer, a tool result — and a small `↬` button appears next to it. One click
+  drops the passage into the open side chat's composer, or starts a new side chat
+  if none is open, so the child can look at exactly what you are looking at.
 - **The chip tells the truth.** A side chat often keeps running while you work
   elsewhere; its tab title pulses while it does.
 
@@ -85,6 +89,11 @@ web page.
   copy and paste.
 - Side chats are per browser profile: the parent-child link lives in
   `localStorage` under `dsh.side-chat.v1`.
+- The passage button is a single document-level element rather than a seat,
+  because a text selection is a browser fact, not a session one. It hides itself
+  when the selection sits inside one of its own panels, and it waits up to 1.5 s
+  for a freshly opened side chat to mount its composer before giving up with a
+  message instead of a draft.
 
 ## Tests
 

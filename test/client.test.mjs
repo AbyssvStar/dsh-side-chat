@@ -34,6 +34,52 @@ let requests = []
 let seedStorage = undefined
 
 /**
+ * A DOM element double that records listeners and children.
+ *
+ * The bundle is a browser script, so the selection widget needs a document to
+ * build itself in. This stands in for the little of `Document`/`Element` it
+ * touches, and lets a test fire the listener the real page would fire.
+ *
+ * @returns {object} element double.
+ */
+function createElementStub() {
+  const element = {
+    dataset: {},
+    style: {},
+    attributes: {},
+    listeners: {},
+    children: [],
+    className: '',
+    textContent: '',
+    hidden: false,
+    disabled: false,
+    offsetWidth: 96,
+    offsetHeight: 28,
+    nodeType: 1,
+    setAttribute(name, value) {
+      this.attributes[name] = String(value)
+    },
+    append(...nodes) {
+      this.children.push(...nodes)
+    },
+    addEventListener(type, handler) {
+      this.listeners[type] = [...(this.listeners[type] ?? []), handler]
+    },
+    removeEventListener(type, handler) {
+      this.listeners[type] = (this.listeners[type] ?? []).filter((candidate) => candidate !== handler)
+    },
+    remove() {},
+    contains() {
+      return false
+    },
+    fire(type, event) {
+      for (const handler of this.listeners[type] ?? []) handler(event)
+    },
+  }
+  return element
+}
+
+/**
  * Reset the browser-ish globals a fresh load installs.
  * @returns {{storage: Map<string, string>}} the shared localStorage backing map.
  */
@@ -75,14 +121,16 @@ async function loadPlugin() {
     seedStorage = undefined
   }
   globalThis.window = { __ModuleLoader__: { load: (definition) => loads.push(definition) } }
-  globalThis.document = {
+  const body = createElementStub()
+  globalThis.document = Object.assign(createElementStub(), {
     getElementById: () => null,
-    createElement: () => {
-      const tag = { dataset: {}, textContent: '', remove() {} }
-      return tag
-    },
-    head: { append() {} },
-  }
+    createElement: () => createElementStub(),
+    head: createElementStub(),
+    body,
+  })
+  globalThis.innerWidth = 1280
+  globalThis.innerHeight = 800
+  globalThis.getSelection = () => undefined
   run += 1
   await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(source)}#${run}`)
 
@@ -123,6 +171,8 @@ function createContext() {
     binding: [],
     draft: [],
     prompt: [],
+    tabsIn: [],
+    focus: [],
   }
   const state = {
     calls,
@@ -135,6 +185,9 @@ function createContext() {
     bindings: {},
     summaries: {},
     draftResult: 'applied',
+    mountedSession: undefined,
+    openTabs: [],
+    activeTab: undefined,
     promptResult: { ok: true, value: { accepted: true } },
   }
   let nextId = 0
@@ -169,6 +222,17 @@ function createContext() {
     sidebarRight: {
       openResource(address, options) {
         calls.openResource.push({ address, options })
+      },
+      mounted: {
+        getSnapshot: () => state.mountedSession,
+      },
+      tabsIn(sessionId) {
+        calls.tabsIn.push(sessionId)
+        return state.openTabs
+      },
+      active: () => state.activeTab,
+      focus(tabId) {
+        calls.focus.push(tabId)
       },
     },
     slots: {
@@ -291,11 +355,110 @@ test('registers one resource protocol, one tab kind, and one turn-footer entry',
   assert.equal(title.definition.inject().sessions, state.ctx.sessions)
 })
 
+/** Let the queued selection scan run. */
+function settle() {
+  return new Promise((resolve) => setTimeout(resolve, 5))
+}
+
+/**
+ * Pretend the page has text highlighted.
+ * @param {{insideSideChat?: boolean}} options - where the selection sits.
+ */
+function selectText(options = {}) {
+  globalThis.getSelection = () => ({
+    isCollapsed: false,
+    toString: () => '  pick this passage  ',
+    anchorNode: {
+      nodeType: 3,
+      parentElement: { closest: () => (options.insideSideChat === true ? {} : null) },
+    },
+    getRangeAt: () => ({
+      getBoundingClientRect: () => ({ right: 200, bottom: 120, top: 100, left: 50, width: 150, height: 20 }),
+    }),
+  })
+}
+
+test('the selection widget shows up over text, and not over a side chat', async () => {
+  const { ctx } = await loadPlugin()
+  const widget = globalThis.document.body.children[0]
+  assert.equal(widget.className, 'dsc-selection')
+  assert.equal(widget.hidden, true, 'nothing is selected yet')
+
+  selectText()
+  globalThis.document.fire('selectionchange')
+  await settle()
+  assert.equal(widget.hidden, false)
+
+  selectText({ insideSideChat: true })
+  globalThis.document.fire('selectionchange')
+  await settle()
+  assert.equal(widget.hidden, true, 'a side chat does not offer to quote itself')
+})
+
+test('a highlighted passage lands in the open side chat composer', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  state_mounted(ctx, 'session-parent')
+  ctx.openTabs = [
+    {
+      id: 'tab-1',
+      kind: 'sidechat',
+      navigation: { address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7' },
+    },
+  ]
+  ctx.activeTab = { id: 'tab-1' }
+  ctx.bindings['session-child-1'] = { sessionId: 'session-child-1' }
+
+  selectText()
+  globalThis.document.fire('selectionchange')
+  await settle()
+  globalThis.document.body.children[0].fire('click', { preventDefault() {} })
+  await settle()
+
+  assert.deepEqual(ctx.calls.fork, [], 'an open side chat is reused, not forked again')
+  assert.deepEqual(ctx.calls.focus, ['tab-1'])
+  assert.equal(sink.drafts.length, 1)
+  assert.deepEqual(sink.drafts[0].options, {
+    prompt: `selection.prompt\n\npick this passage`,
+    clearPreviousDraft: false,
+  })
+})
+
+test('without an open side chat the passage starts one at the latest turn', async () => {
+  const { ctx } = await loadPlugin()
+  const sink = installConversation(ctx)
+  state_mounted(ctx, 'session-parent')
+  ctx.bindings['session-child-1'] = { sessionId: 'session-child-1' }
+
+  selectText()
+  globalThis.document.fire('selectionchange')
+  await settle()
+  globalThis.document.body.children[0].fire('click', { preventDefault() {} })
+  await settle()
+
+  assert.deepEqual(ctx.calls.fork, [{ sessionId: 'session-parent', increaseTitle: false }])
+  const [{ address }] = ctx.calls.openResource
+  assert.equal(address, 'dsh-resource://sidechat/session/session-child-1?parent=session-parent')
+  assert.equal(sink.drafts.length, 1)
+  assert.equal(sink.drafts[0].options.prompt, `selection.prompt\n\npick this passage`)
+})
+
+/**
+ * Point the sidebar at one on-screen session.
+ * @param {object} ctx - fake context.
+ * @param {string} sessionId - session the user is looking at.
+ */
+function state_mounted(ctx, sessionId) {
+  ctx.mountedSession = sessionId
+}
+
 test('accepts only its own addresses', async () => {
   const { ctx } = await loadPlugin()
   const { canOpen } = ctx.tab
   assert.equal(canOpen('dsh-resource://sidechat/session/session-a?parent=session-p&at=12'), true)
-  assert.equal(canOpen('dsh-resource://sidechat/session/session-a?parent=session-p'), false)
+  // A side chat started from a selection has no fork point, so `at` is optional.
+  assert.equal(canOpen('dsh-resource://sidechat/session/session-a?parent=session-p'), true)
+  assert.equal(canOpen('dsh-resource://sidechat/session/session-a?parent=session-p&at=abc'), false)
   assert.equal(canOpen('dsh-resource://subagentchat/session/session-a?parent=session-p&mode=x'), false)
   assert.equal(canOpen('dsh-resource://sidechat/turn/session-a?parent=session-p&at=1'), false)
   assert.equal(canOpen('https://example.com/sidechat/session/a?parent=p&at=1'), false)
