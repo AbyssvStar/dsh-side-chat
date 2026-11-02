@@ -395,6 +395,33 @@ test('the selection widget shows up over text, and not over a side chat', async 
   assert.equal(widget.hidden, true, 'a side chat does not offer to quote itself')
 })
 
+test('the widget leaves again when the selection is dropped', async () => {
+  const { ctx } = await loadPlugin()
+  const widget = globalThis.document.body.children[0]
+  assert.equal(widget.style.display, 'none', 'display is what the browser obeys')
+
+  selectText()
+  globalThis.document.fire('selectionchange')
+  await settle()
+  assert.equal(widget.style.display, 'inline-flex')
+
+  // Clicking somewhere harmless collapses the selection to nothing.
+  globalThis.getSelection = () => ({ isCollapsed: true, toString: () => '' })
+  globalThis.document.fire('selectionchange')
+  await settle()
+  assert.equal(widget.hidden, true)
+  assert.equal(widget.style.display, 'none', 'the attribute alone would leave it on screen')
+})
+
+test('the stylesheet hides the widget even without the inline display', async () => {
+  await loadPlugin()
+  const rule = globalThis.document.head.children.find(
+    (element) => element.id === 'dsh-side-chat-styles',
+  )
+  assert.ok(rule !== undefined, 'styles are mounted')
+  assert.match(rule.textContent, /\.dsc-selection\[hidden\] \{\s*display: none;?\s*\}/)
+})
+
 test('a highlighted passage lands in the open side chat composer', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
@@ -604,7 +631,10 @@ test('an unreachable host route is reported as a status, not as a JSON error', a
   // A plugin whose host half never registered the route answers an empty 404.
   handoff = { status: 404, body: undefined }
 
-  await assert.rejects(turnTail(ctx).inject(childId).run(0), /carry-back: HTTP 404 with an empty body/)
+  await assert.rejects(
+    turnTail(ctx).inject(childId).run(0),
+    /carry-back: HTTP 404 with an empty body — the host half of dsh-side-chat may not be running/,
+  )
 })
 
 test('shift carry-back queues the conclusion as main-line context', async () => {

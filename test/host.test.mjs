@@ -136,6 +136,36 @@ test('registers both exact routes, and only when a webserver exists', () => {
   )
 })
 
+test('registers the routes when the webserver shows up late', () => {
+  // The plugin body may run before the webserver's own fiber is active, which
+  // is exactly how the first release shipped without any routes at all.
+  const routes = []
+  let pending
+  apply({
+    get: () => undefined,
+    effect: (factory) => factory(),
+    inject(_dependencies, body) {
+      pending = body
+      return () => {}
+    },
+  })
+  assert.equal(routes.length, 0, 'nothing yet: the webserver has not arrived')
+
+  const late = {
+    get: (serviceName) =>
+      serviceName === 'webServer'
+        ? { register(route) { routes.push(route); return () => {} } }
+        : undefined,
+    effect: (factory) => factory(),
+  }
+  pending(late)
+
+  assert.deepEqual(
+    routes.map((route) => route.path),
+    ['/side-chat/handoff', '/side-chat/context'],
+  )
+})
+
 test('rejects a non-GET request without touching persistence', async () => {
   const { ctx, routes } = withWebServer()
   const reply = await call({ ctx, routes }, { method: 'POST', url: '/side-chat/handoff?child=abc' })
