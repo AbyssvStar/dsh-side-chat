@@ -54,8 +54,8 @@ function installBrowserStubs() {
     return {
       ok: reply.status < 400,
       status: reply.status,
-      async json() {
-        return reply.body
+      async text() {
+        return reply.body === undefined ? '' : JSON.stringify(reply.body)
       },
     }
   }
@@ -387,7 +387,9 @@ test('carry-back puts the answer in the main composer instead of speaking for th
   const result = await turnTail(ctx).inject(childId).run(0)
 
   assert.equal(result, 'drafted')
-  assert.deepEqual(handoffs, [`/side-chat/handoff?child=${encodeURIComponent(childId)}`])
+  assert.deepEqual(handoffs, [
+    `/side-chat/handoff?child=${encodeURIComponent(childId)}&parent=session-parent`,
+  ])
   assert.equal(sink.drafts.length, 1)
   assert.equal(sink.drafts[0].binding, ctx.bindings['session-parent'])
   assert.equal(sink.drafts[0].options.clearPreviousDraft, false)
@@ -430,6 +432,18 @@ test('carry-back reports an empty side chat instead of drafting nothing', async 
   assert.deepEqual(ctx.calls.prompt, [])
 })
 
+test('an unreachable host route is reported as a status, not as a JSON error', async () => {
+  const { ctx } = await loadPlugin()
+  installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  // A plugin whose host half never registered the route answers an empty 404.
+  handoff = { status: 404, body: undefined }
+
+  await assert.rejects(turnTail(ctx).inject(childId).run(0), /carry-back: HTTP 404 with an empty body/)
+})
+
 test('shift carry-back queues the conclusion as main-line context', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
@@ -447,9 +461,12 @@ test('shift carry-back queues the conclusion as main-line context', async () => 
   assert.equal(post.init.method, 'POST')
   assert.equal(post.init.credentials, 'same-origin')
   assert.equal(post.init.headers['Content-Type'], 'application/json')
+  // The marker is what a cross-site caller cannot set without a preflight the host never grants.
+  assert.equal(post.init.headers['X-Side-Chat'], '1')
   assert.deepEqual(JSON.parse(post.init.body), {
     sessionId: 'session-parent',
     text: '侧聊的结论：\n\nuse a Map, not an array',
+    parent: childId,
   })
   assert.equal(sink.drafts.length, 0, 'context needs no composer')
   assert.deepEqual(ctx.calls.prompt, [])

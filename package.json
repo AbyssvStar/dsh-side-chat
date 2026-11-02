@@ -6,7 +6,8 @@
   "type": "module",
   "main": "lib/index.js",
   "scripts": {
-    "test": "node test/client.test.mjs && node test/host.test.mjs"
+    "test": "node test/client.test.mjs && node test/host.test.mjs",
+    "check": "node scripts/check-dsh-compat.mjs"
   },
   "exports": {
     ".": {

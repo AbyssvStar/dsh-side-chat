@@ -55,6 +55,25 @@ the log stays readable, and it reaches the model without impersonating the user.
 If the parent session is cold, the host answers `409` and the browser falls back
 to the draft.
 
+## Who may call the host routes
+
+Both routes are loopback-only in practice, but "loopback" is not a permission
+check: any page the browser loads can try. Two cheap fences:
+
+- **Origin.** A request that names a `Sec-Fetch-Site` other than `same-origin`
+  or `none`, or an `Origin` that is not this host, is refused with `403`.
+- **Ownership.** The handoff route takes `child` *and* `parent` and refuses with
+  `403` unless the stored log's `parentSession` matches. Knowing a session id is
+  not a licence to read its prose.
+
+The write route also requires an `X-Side-Chat: 1` header. A cross-site form or
+image cannot set a custom header, and a cross-site `fetch` that does needs a
+preflight this server never grants.
+
+These are not authentication — the GUI's own session is the only credential on
+this socket — and they do not stop a hostile *local* process. They stop a hostile
+web page.
+
 ## Known limits
 
 - **A fork is listed in the session list.** DSH has no hidden flag for sessions,
@@ -74,5 +93,20 @@ npm test
 ```
 
 Two suites run without a browser: `test/client.test.mjs` evaluates the real
-bundle against a stub runtime, and `test/host.test.mjs` drives the handoff route
-and the log scan.
+bundle against a stub runtime, and `test/host.test.mjs` drives both routes and
+the log scan.
+
+## Compatibility
+
+The plugin leans on harness seams that are not a public API: `ctx.get('agents')`,
+`ctx.get('sessionPersistence')`, `ctx.get('webServer')`, and four client seats
+(`conversation.chat.turnTail`, `sidebar.right.pane.tab`, its `.title`, and
+`requestDraftInitialization`). A DSH upgrade may move any of them.
+
+```sh
+npm run check            # or: node scripts/check-dsh-compat.mjs <dsh-root>
+```
+
+That script asserts each seam still exists in the installed DSH and names the
+one that broke, rather than leaving it to a browser console. It was written
+against DSH 0.2.1-rc.2.

@@ -32,6 +32,10 @@ function withWebServer() {
     effect(factory) {
       return factory()
     },
+    inject(dependencies, body) {
+      assert.deepEqual(dependencies, ['webServer'])
+      return body(ctx)
+    },
   }
   return { ctx, routes }
 }
@@ -58,7 +62,7 @@ function createResponse() {
 /**
  * Drive one registered route once.
  * @param {{ routes: object[], ctx: object }} harness - context with its routes.
- * @param {{ method?: string, url: string, body?: string, path?: string }} request - what the browser sends.
+ * @param {{ method?: string, url: string, body?: string, path?: string, headers?: object }} request - what the browser sends.
  * @returns {Promise<{ status: number, json: any, headers: object }>} the reply.
  */
 async function call(harness, request) {
@@ -67,7 +71,11 @@ async function call(harness, request) {
   const route = harness.routes.find((candidate) => candidate.path === path)
   assert.ok(route, `the ${path} route should be registered`)
   const response = createResponse()
-  const base = { method: request.method ?? 'GET', url: request.url }
+  const base = {
+    method: request.method ?? 'GET',
+    url: request.url,
+    headers: Object.assign({ host: '127.0.0.1:3080' }, request.headers),
+  }
   const req = request.body === undefined
     ? base
     : Object.assign(Readable.from([Buffer.from(request.body, 'utf8')]), base)
@@ -91,7 +99,17 @@ function logWith(text, turn) {
     {
       seq: 1,
       type: 'assistant/message',
-      data: { turn, step: 0, message: { content: [{ kind: 'text', text }] } },
+      data: {
+        turn,
+        step: 0,
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: '' },
+            { type: 'text', text },
+          ],
+        },
+      },
     },
     { seq: 2, type: 'turn/end', data: { turn } },
   ]
@@ -99,7 +117,13 @@ function logWith(text, turn) {
 
 test('registers both exact routes, and only when a webserver exists', () => {
   const bare = withWebServer()
-  apply({ get: () => undefined, effect: (factory) => factory() })
+  apply({
+    get: () => undefined,
+    effect: (factory) => factory(),
+    inject(_dependencies, body) {
+      return body({ get: () => undefined, effect: (factory) => factory() })
+    },
+  })
   assert.equal(bare.routes.length, 0)
 
   apply(bare.ctx)
@@ -130,7 +154,7 @@ test('rejects a missing or malformed child id', async () => {
 
 test('reports an unmounted persistence service instead of pretending to be empty', async () => {
   const { ctx, routes } = withWebServer()
-  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1' })
+  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1&parent=session-main' })
   assert.equal(reply.status, 503)
   assert.match(reply.json.error, /persistence/)
 })
@@ -147,7 +171,7 @@ test('answers with the last prose of an existing side chat', async () => {
             assert.equal(id, 'session-child-1')
             assert.equal(mode, 'read')
             return {
-              header: { title: 'Side chat · main · fork 3' },
+              header: { title: 'Side chat · main · fork 3', parentSession: 'session-main' },
               async read() {
                 return { events }
               },
@@ -158,7 +182,7 @@ test('answers with the last prose of an existing side chat', async () => {
           },
         }
 
-  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1' })
+  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1&parent=session-main' })
 
   assert.equal(reply.status, 200)
   assert.deepEqual(reply.json, {
@@ -181,11 +205,11 @@ test('truncates a very long answer and says so', async () => {
       ? { register: (route) => (routes.push(route), () => {}) }
       : {
           async open() {
-            return { header: {}, read: async () => ({ events }), close: async () => {} }
+            return { header: { parentSession: 'session-main' }, read: async () => ({ events }), close: async () => {} }
           },
         }
 
-  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1' })
+  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1&parent=session-main' })
   assert.equal(reply.status, 200)
   assert.equal(reply.json.text.length, 8000)
   assert.equal(reply.json.truncated, true)
@@ -203,7 +227,7 @@ test('maps an unreadable side chat to 404', async () => {
           },
         }
 
-  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-gone' })
+  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-gone&parent=session-main' })
   assert.equal(reply.status, 404)
   assert.match(reply.json.error, /no such session/)
 })
@@ -214,20 +238,46 @@ test('lastAnswer prefers the newest prose and skips tool-only messages', () => {
     {
       seq: 3,
       type: 'assistant/message',
-      data: { turn: 1, step: 0, message: { content: [{ kind: 'tool-call', name: 'bash' }] } },
+      data: { turn: 1, step: 0, message: { content: [{ type: 'tool-call', name: 'bash' }] } },
     },
     {
       seq: 4,
       type: 'assistant/message',
-      data: { turn: 1, step: 1, message: { content: [{ kind: 'text', text: '' }] } },
+      data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '' }] } },
     },
     {
       seq: 5,
       type: 'assistant/message',
-      data: { turn: 1, step: 2, message: { content: [{ kind: 'text', text: 'first para' }, { kind: 'text', text: 'second para' }] } },
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          content: [
+            { type: 'text', text: 'first para' },
+            { type: 'text', text: 'second para' },
+          ],
+        },
+      },
     },
   ]
   assert.deepEqual(lastAnswer(events), { text: 'first para\nsecond para', turn: 1 })
+})
+
+test('lastAnswer reads both the stored and the in-memory part shapes', () => {
+  // The log tags parts `type` and keeps them under `data.message.content`;
+  // older in-memory shapes used `kind`, and a user message keeps parts under
+  // `data.content`. Reading only one of these made every carry-back answer
+  // "no answer yet" even though the tests were green.
+  const stored = logWith('stored prose', 2)
+  assert.deepEqual(lastAnswer(stored), { text: 'stored prose', turn: 2 })
+
+  const legacy = [
+    { seq: 0, type: 'assistant/message', data: { turn: 3, message: { content: [{ kind: 'text', text: 'legacy prose' }] } } },
+  ]
+  assert.deepEqual(lastAnswer(legacy), { text: 'legacy prose', turn: 3 })
+
+  const flat = [{ seq: 0, type: 'assistant/message', data: { turn: 4, content: [{ type: 'text', text: 'flat prose' }] } }]
+  assert.deepEqual(lastAnswer(flat), { text: 'flat prose', turn: 4 })
 })
 
 test('lastAnswer tolerates junk and finds nothing in an empty log', () => {
@@ -269,7 +319,13 @@ test('the context route rejects a non-POST request', async () => {
 
 test('the context route rejects a malformed body, session, or text', async () => {
   const harness = withAgents(() => ({}))
-  const send = (body) => call(harness, { method: 'POST', url: '/side-chat/context', path: '/side-chat/context', body })
+  const send = (body) => call(harness, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    headers: { 'x-side-chat': '1' },
+    body,
+  })
 
   assert.equal((await send('not json')).status, 400)
   assert.equal((await send(JSON.stringify({ sessionId: '../etc/passwd', text: 'hi' }))).status, 400)
@@ -281,7 +337,13 @@ test('the context route rejects a malformed body, session, or text', async () =>
 test('the context route refuses an oversized body before parsing it', async () => {
   const harness = withAgents(() => ({}))
   const huge = JSON.stringify({ sessionId: 'session-main', text: 'x'.repeat(60000) })
-  const reply = await call(harness, { method: 'POST', url: '/side-chat/context', path: '/side-chat/context', body: huge })
+  const reply = await call(harness, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    headers: { 'x-side-chat': '1' },
+    body: huge,
+  })
   assert.equal(reply.status, 400)
   assert.match(reply.json.error, /too large/)
 })
@@ -291,6 +353,7 @@ test('the context route degrades when the agent registry or the agent is missing
   const noRegistry = await call(registryGone, {
     method: 'POST',
     url: '/side-chat/context',
+    headers: { 'x-side-chat': '1' },
     path: '/side-chat/context',
     body: JSON.stringify({ sessionId: 'session-main', text: 'note' }),
   })
@@ -301,6 +364,7 @@ test('the context route degrades when the agent registry or the agent is missing
   const notLive = await call(cold, {
     method: 'POST',
     url: '/side-chat/context',
+    headers: { 'x-side-chat': '1' },
     path: '/side-chat/context',
     body: JSON.stringify({ sessionId: 'session-main', text: 'note' }),
   })
@@ -313,6 +377,7 @@ test('the context route queues the note as plugin-sourced user context', async (
   const reply = await call(harness, {
     method: 'POST',
     url: '/side-chat/context',
+    headers: { 'x-side-chat': '1' },
     path: '/side-chat/context',
     body: JSON.stringify({ sessionId: 'session-main', text: 'use a Map, not an array' }),
   })
@@ -337,11 +402,104 @@ test('the context route reports a failing inject as a server error', async () =>
   const reply = await call(harness, {
     method: 'POST',
     url: '/side-chat/context',
+    headers: { 'x-side-chat': '1' },
     path: '/side-chat/context',
     body: JSON.stringify({ sessionId: 'session-main', text: 'note' }),
   })
   assert.equal(reply.status, 500)
   assert.match(reply.json.error, /disposing/)
+})
+
+test('the handoff route requires the parent it belongs to', async () => {
+  const { ctx, routes } = withWebServer()
+  const missing = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1' })
+  assert.equal(missing.status, 400)
+  assert.match(missing.json.error, /parent/)
+
+  const malformed = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1&parent=../nope' })
+  assert.equal(malformed.status, 400)
+  assert.match(malformed.json.error, /parent/)
+})
+
+test('the handoff route refuses a side chat forked from another session', async () => {
+  const { ctx, routes } = withWebServer()
+  ctx.get = (serviceName) =>
+    serviceName === 'webServer'
+      ? { register: (route) => (routes.push(route), () => {}) }
+      : {
+          async open() {
+            return {
+              header: { title: 'Side chat · someone else', parentSession: 'session-other' },
+              read: async () => ({ events: [] }),
+              close: async () => {},
+            }
+          },
+        }
+
+  const reply = await call({ ctx, routes }, { url: '/side-chat/handoff?child=session-child-1&parent=session-main' })
+  assert.equal(reply.status, 403)
+  assert.match(reply.json.error, /does not belong/)
+})
+
+test('refuses a request that another origin drove', async () => {
+  const { ctx, routes } = withWebServer()
+  const url = '/side-chat/handoff?child=session-child-1&parent=session-main'
+
+  const otherOrigin = await call({ ctx, routes }, { url, headers: { origin: 'http://evil.example' } })
+  assert.equal(otherOrigin.status, 403)
+  assert.match(otherOrigin.json.error, /untrusted/)
+
+  const crossSite = await call({ ctx, routes }, { url, headers: { 'sec-fetch-site': 'cross-site' } })
+  assert.equal(crossSite.status, 403)
+
+  const stranger = await call({ ctx, routes }, { url, headers: { origin: 'http://localhost:9999' } })
+  assert.equal(stranger.status, 403)
+})
+
+test('a same-origin handoff request passes the origin fence', async () => {
+  const { ctx, routes } = withWebServer()
+  ctx.get = (serviceName) =>
+    serviceName === 'webServer'
+      ? { register: (route) => (routes.push(route), () => {}) }
+      : {
+          async open() {
+            return {
+              header: { parentSession: 'session-main' },
+              read: async () => ({ events: logWith('ok', 0) }),
+              close: async () => {},
+            }
+          },
+        }
+
+  const reply = await call(
+    { ctx, routes },
+    {
+      url: '/side-chat/handoff?child=session-child-1&parent=session-main',
+      headers: { origin: 'http://127.0.0.1:3080', 'sec-fetch-site': 'same-origin' },
+    },
+  )
+  assert.equal(reply.status, 200)
+})
+
+test('the context route refuses a write without its marker or from another origin', async () => {
+  const harness = withAgents(() => ({}))
+  const body = JSON.stringify({ sessionId: 'session-main', text: 'note' })
+  const send = (headers) => call(harness, {
+    method: 'POST',
+    url: '/side-chat/context',
+    path: '/side-chat/context',
+    headers,
+    body,
+  })
+
+  const unmarked = await send({})
+  assert.equal(unmarked.status, 403)
+  assert.match(unmarked.json.error, /marker/)
+
+  const markedButCrossOrigin = await send({ 'x-side-chat': '1', origin: 'http://evil.example' })
+  assert.equal(markedButCrossOrigin.status, 403)
+  assert.match(markedButCrossOrigin.json.error, /untrusted/)
+  assert.equal(harness.injected.length, 0, 'nothing may be injected by a refused request')
 })
 
 test('the plugin announces a name', () => {

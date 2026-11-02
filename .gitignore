@@ -147,3 +147,6 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Local scratch: decompressed session logs and one-off probes
+.tmp/
