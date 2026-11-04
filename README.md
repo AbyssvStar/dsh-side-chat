@@ -15,16 +15,19 @@ side chat can explore a bad idea without touching the main line.
   Unlike the built-in branch, it does not leave the current conversation.
 - **A full chat, not a preview.** The panel embeds the same conversation view
   as the main window, with its own composer, tools, and approvals.
-- **Carry back, deliberately.** Inside a side chat, `↩` puts its last answer
-  into the parent's composer as a draft. You see it, edit it, and decide when
-  to send. If the composer cannot take it, the note is sent as a user message
-  instead — the only other channel the model can see.
-- **Carry back as background.** `Shift`-click `↩` instead queues the same text
-  as model-facing context on the main line: the next turn can see it, nothing
-  is woken, and the plugin never speaks in your voice. The chat view already
-  renders plugin-sourced context as a context line rather than a bubble.
+- **Carry back, deliberately.** Inside a side chat, `↩` first asks that side chat
+  to condense itself into a short conclusion (a real turn, visible in its
+  transcript), then puts the conclusion into the parent's composer as a draft.
+  You see it, edit it, and decide when to send. If the composer cannot take it,
+  the carry reports a failure — it never sends a message on your behalf.
+- **Carry back as background.** `Shift`-click `↩` summarises the same way and
+  queues the text as model-facing context on the main line: the next turn can
+  see it, nothing is woken, and no turn starts. `agent.inject()` is the
+  no-wakeup queue (`send(input, 'next-step', false)`), which is why an idle main
+  line stays idle. The chat view already renders plugin-sourced context as a
+  context line rather than a bubble.
 - **Quote, don't dump.** Select text before pressing `↩` and only the selection
-  is carried back, not the whole answer.
+  is carried back — no summary, no whole answer.
 - **Send a passage the other way.** Select text anywhere in the page — a main-line
   answer, a tool result — and a small `↬` button appears next to it. One click
   drops the passage into the open side chat's composer, or starts a new side chat
@@ -32,14 +35,17 @@ side chat can explore a bad idea without touching the main line.
 - **The chip tells the truth.** A side chat often keeps running while you work
   elsewhere; its tab title pulses while it does.
 - **Open one from the split.** The empty right column lists every tab type as an
-  entry capsule (terminal, files, previews); side chat is one of them, so a
-  question can start beside the terminal without finding a turn footer first.
+  entry capsule (terminal, files, previews); side chat contributes two: *follow
+  the main line* forks the latest turn, and *blank* starts a session that carries
+  nothing over — no origin, no carry-back button, for questions that have nothing
+  to do with the task at hand.
 - **Each side chat has a name.** A fork inherits its parent's title verbatim, so
   the list used to fill with identical rows. A new side chat is renamed to
   `Side chat · MM-DD HH:mm` a moment after it opens.
-- **Closing it offers to archive it.** Closing the tab asks once; saying yes
-  archives the child (it leaves the list but stays recoverable under the archive
-  filter), saying no leaves it exactly where it was.
+- **Closing it offers to archive it.** Closing the tab raises a small card inside
+  the page (not `window.confirm`); saying yes archives the child (it leaves the
+  list but stays recoverable under the archive filter), saying no leaves it
+  exactly where it was.
 
 ## Install
 
@@ -57,16 +63,21 @@ DSH does not let an out-of-tree plugin append a model-visible event to a
 session log: persistence refuses logs whose event types are outside its known
 set, and the "ignorable" escape hatch is for in-tree plugins and never reaches
 the model. So the browser half asks the host half for the child's last answer
-over `GET /side-chat/handoff?child=<sessionId>`, and the host half reads the
-stored log through `sessionPersistence` — read-only, one route, no new
-dependencies.
+over `GET /side-chat/handoff?child=<sessionId>&parent=<parentSessionId>`, and the
+host half reads the stored log through `sessionPersistence` — read-only, one
+route, no new dependencies.
+
+A carry is two steps: read the answer that is there, ask the side chat to write
+its conclusion, then poll that route until a *new* answer appears and the turn is
+no longer running (two-minute cap, after which the old answer is carried instead
+of spinning forever).
 
 The context carrier goes the other way, over `POST /side-chat/context`, because
 only the host can reach a live agent: `agent.inject()` persists an ordinary
 `user/message` whose `source.kind` is `side-chat`. That is a known event type, so
-the log stays readable, and it reaches the model without impersonating the user.
-If the parent session is cold, the host answers `409` and the browser falls back
-to the draft.
+the log stays readable, it reaches the model without impersonating the user, and
+it does not start a turn. If the parent session is cold, the host answers `409`
+and the carry fails loudly rather than degrading into a message you never wrote.
 
 ## Who may call the host routes
 
