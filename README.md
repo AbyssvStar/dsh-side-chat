@@ -31,6 +31,15 @@ side chat can explore a bad idea without touching the main line.
   if none is open, so the child can look at exactly what you are looking at.
 - **The chip tells the truth.** A side chat often keeps running while you work
   elsewhere; its tab title pulses while it does.
+- **Open one from the split.** The empty right column lists every tab type as an
+  entry capsule (terminal, files, previews); side chat is one of them, so a
+  question can start beside the terminal without finding a turn footer first.
+- **Each side chat has a name.** A fork inherits its parent's title verbatim, so
+  the list used to fill with identical rows. A new side chat is renamed to
+  `Side chat · MM-DD HH:mm` a moment after it opens.
+- **Closing it offers to archive it.** Closing the tab asks once; saying yes
+  archives the child (it leaves the list but stays recoverable under the archive
+  filter), saying no leaves it exactly where it was.
 
 ## Install
 
@@ -83,12 +92,19 @@ web page.
 - **A fork is listed in the session list.** DSH has no hidden flag for sessions,
   and every supported alternative costs more than it saves: archiving makes a
   session unable to run a turn, and the subagent origin turns the composer
-  read-only. The child therefore appears under its parent, indented.
+  read-only. The child therefore appears under its parent, indented. The plugin
+  settles for making the rows distinguishable (a timestamped title) and for
+  asking whether to archive when the tab closes.
+- **An archived side chat cannot be resumed.** That is DSH's own gate: an
+  archived session is rejected before its first step. Archive only the ones you
+  are done with.
 - Only the browser half needs the GUI; the host route is optional. Without a
   webserver (headless, tui) the panel still works and carry-back falls back to
   copy and paste.
 - Side chats are per browser profile: the parent-child link lives in
-  `localStorage` under `dsh.side-chat.v1`.
+  `localStorage` under `dsh.side-chat.v1`. A fork this browser did not open
+  (one made by the built-in Branch command, or one opened before that map
+  existed) still offers carry-back, because the catalog row names its parent.
 - The passage button is a single document-level element rather than a seat,
   because a text selection is a browser fact, not a session one. It hides itself
   when the selection sits inside one of its own panels, and it waits up to 1.5 s
