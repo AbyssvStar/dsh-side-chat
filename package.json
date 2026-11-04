@@ -3,6 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "description": "Codex-style side chat for the DSH web GUI: fork any turn into a right-sidebar chat, keep the main line untouched, and bring the conclusion back on demand.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AbyssvStar/dsh-side-chat.git"
+  },
+  "homepage": "https://github.com/AbyssvStar/dsh-side-chat#readme",
+  "bugs": {
+    "url": "https://github.com/AbyssvStar/dsh-side-chat/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "side-chat",
+    "codex",
+    "sidebar"
+  ],
   "type": "module",
   "main": "lib/index.js",
   "scripts": {

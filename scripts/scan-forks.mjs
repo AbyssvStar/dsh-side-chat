@@ -1,8 +1,29 @@
+/**
+ * List the sessions on this machine that were forked from another one.
+ *
+ * A debug aid, not part of the plugin: it reads the session store read-only and
+ * prints the header of every log whose `parentSession` is set. The store is
+ * `$DSH_HOME/sessions`, or `~/.dsh/sessions` when that is unset; pass a
+ * directory to override both.
+ *
+ * Usage: node scripts/scan-forks.mjs [sessions-dir]
+ */
 import { readdirSync, statSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
-const root = 'C:/Users/WYC/.dsh/sessions'
+/**
+ * Resolve the session store without baking this machine's home directory in.
+ * @returns {string} directory that holds the per-project buckets.
+ */
+function sessionsRoot() {
+  if (process.argv[2] !== undefined) return process.argv[2]
+  if (process.env.DSH_HOME !== undefined) return join(process.env.DSH_HOME, 'sessions')
+  return join(homedir(), '.dsh', 'sessions')
+}
+
+const root = sessionsRoot()
 for (const bucket of readdirSync(root)) {
   const bucketPath = join(root, bucket)
   let sessions
