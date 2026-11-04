@@ -69,6 +69,7 @@ function createElementStub() {
       this.listeners[type] = (this.listeners[type] ?? []).filter((candidate) => candidate !== handler)
     },
     remove() {},
+    focus() {},
     contains() {
       return false
     },
@@ -96,7 +97,7 @@ function installBrowserStubs() {
     const target = String(url)
     requests.push({ url: target, init })
     if (target.startsWith('/side-chat/handoff')) handoffs.push(target)
-    const reply = target.startsWith('/side-chat/context') ? context : handoff
+    const reply = target.startsWith('/side-chat/context') ? context : typeof handoff === 'function' ? handoff() : handoff
     return {
       ok: reply.status < 400,
       status: reply.status,
@@ -143,7 +144,11 @@ async function loadPlugin() {
     useSyncExternalStore: (_subscribe, read) => read(),
     createElement: () => null,
   }
-  const jsxRuntime = { jsx: () => null, jsxs: () => null, Fragment: 'Fragment' }
+  const jsxRuntime = {
+    jsx: (type, props) => ({ type, props }),
+    jsxs: (type, props) => ({ type, props }),
+    Fragment: 'Fragment',
+  }
   const registry = {
     react,
     'react/jsx-runtime': jsxRuntime,
@@ -165,6 +170,7 @@ async function loadPlugin() {
 function createContext() {
   const calls = {
     fork: [],
+    create: [],
     openResource: [],
     retain: [],
     release: [],
@@ -265,6 +271,11 @@ function createContext() {
         calls.fork.push(options)
         nextId += 1
         return `session-child-${nextId}`
+      },
+      async create(options) {
+        calls.create.push(options)
+        nextId += 1
+        return `session-blank-${nextId}`
       },
       retain(target, options) {
         calls.retain.push({ target, options })
@@ -375,6 +386,29 @@ test('registers one resource protocol, one tab kind, and one turn-footer entry',
 /** Let the queued selection scan run. */
 function settle() {
   return new Promise((resolve) => setTimeout(resolve, 5))
+}
+
+/**
+ * Answer the first handoff with the answer that was already there, and every
+ * later one with what the summarise turn wrote.
+ *
+ * The carry-back reads once before asking for a summary and then polls, so a
+ * fixed response would look like "nothing changed" and the poll would run to its
+ * timeout.
+ *
+ * @param {string} before - the answer already on disk.
+ * @param {string} after - the summary the side chat produces.
+ * @returns {() => object} handoff responder.
+ */
+function handoffThen(before, after) {
+  let reads = 0
+  return () => {
+    reads += 1
+    return {
+      status: 200,
+      body: { ok: true, text: reads === 1 ? before : after, turn: reads === 1 ? 1 : 2 },
+    }
+  }
 }
 
 /**
@@ -503,10 +537,49 @@ test('accepts only its own addresses', async () => {
   // A side chat started from a selection has no fork point, so `at` is optional.
   assert.equal(canOpen('dsh-resource://sidechat/session/session-a?parent=session-p'), true)
   assert.equal(canOpen('dsh-resource://sidechat/session/session-a?parent=session-p&at=abc'), false)
+  // A blank side chat is a plain session with nothing to come back from.
+  assert.equal(canOpen('dsh-resource://sidechat/session/session-a'), true)
   assert.equal(canOpen('dsh-resource://subagentchat/session/session-a?parent=session-p&mode=x'), false)
   assert.equal(canOpen('dsh-resource://sidechat/turn/session-a?parent=session-p&at=1'), false)
   assert.equal(canOpen('https://example.com/sidechat/session/a?parent=p&at=1'), false)
   assert.equal(canOpen('not a url'), false)
+})
+
+test('the sidebar guide offers a branch and a blank side chat', async () => {
+  const { ctx } = await loadPlugin()
+
+  assert.deepEqual(
+    ctx.tab.guide.map((entry) => entry.id),
+    ['branch', 'blank'],
+  )
+
+  const guide = ctx.slots.find((slot) => slot.definition.name === 'sidebar.right.tab.guide.entry')
+  assert.equal(guide.definition.key, 'dsh-side-chat')
+  ctx.summaries['session-parent'] = { cwd: 'D:/work' }
+  const injected = guide.definition.inject('session-parent')
+
+  const blank = await injected.openBlank()
+  await settle()
+
+  assert.deepEqual(ctx.calls.create, [{ cwd: 'D:/work' }], 'a blank chat starts where the user is')
+  assert.equal(
+    ctx.calls.openResource.at(-1).address,
+    `dsh-resource://sidechat/session/${encodeURIComponent(blank)}`,
+    'no parent means no carry-back, which is the point',
+  )
+  assert.match(ctx.calls.rename.at(-1).title, /^chat.prefix\d{2}-\d{2} \d{2}:\d{2}$/)
+})
+
+test('the guide capsule tells a branch from a blank chat', async () => {
+  const { ctx } = await loadPlugin()
+  const guide = ctx.slots.find((slot) => slot.definition.name === 'sidebar.right.tab.guide.entry')
+  const { component } = guide
+
+  const branch = component({ t: (key) => key, entryId: 'branch', title: 'branch', description: 'follow' })
+  const blank = component({ t: (key) => key, entryId: 'blank', title: 'blank', description: 'nothing' })
+
+  assert.equal(branch.props['data-sidebar-right-guide-entry'], 'sidechat')
+  assert.equal(blank.props['data-sidebar-right-guide-entry'], 'sidechat-blank')
 })
 
 test('forking a turn opens a sidebar resource and never a workspace session', async () => {
@@ -553,18 +626,24 @@ test('carry-back quotes only the highlighted passage when there is one', async (
   }
 })
 
-test('carry-back falls back to the whole answer without a selection', async () => {
+test('carry-back summarises the side chat before carrying it', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
   ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
 
   const childId = await turnTail(ctx).inject('session-parent').run(5)
-  handoff = { status: 200, body: { ok: true, text: 'the whole answer', turn: 0 } }
+  handoff = handoffThen('the whole answer', 'a short summary')
   globalThis.getSelection = () => ({ toString: () => '   ' })
 
   try {
-    await turnTail(ctx).inject(childId).run(0)
-    assert.equal(sink.drafts[0].options.prompt, '侧聊的结论：\n\nthe whole answer')
+    const result = await turnTail(ctx).inject(childId).run(0)
+    assert.equal(result, 'drafted')
+    assert.equal(sink.drafts[0].options.prompt, '侧聊的结论：\n\na short summary')
+    assert.equal(ctx.calls.prompt.length, 1, 'the side chat is asked for a summary first')
+    assert.equal(ctx.calls.prompt[0].target, childId)
+    assert.deepEqual(ctx.calls.prompt[0].content, [
+      { type: 'text', text: 'carry.summaryPrompt' },
+    ])
   } finally {
     delete globalThis.getSelection
   }
@@ -583,47 +662,50 @@ test('a side chat offers carry-back from its own turns, across a reload', async 
   assert.equal(turnTail(reloaded.ctx).inject('session-unrelated').mode, 'open')
 })
 
-test('carry-back puts the answer in the main composer instead of speaking for the user', async () => {
+test('carry-back puts the summary in the main composer instead of speaking for the user', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
   ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
 
   const childId = await turnTail(ctx).inject('session-parent').run(3)
-  handoff = { status: 200, body: { ok: true, text: '  use a Map, not an array  ', turn: 2 } }
+  handoff = handoffThen('  use a Map, not an array  ', '用 Map，不要用数组')
 
   const result = await turnTail(ctx).inject(childId).run(0)
 
   assert.equal(result, 'drafted')
   assert.deepEqual(handoffs, [
     `/side-chat/handoff?child=${encodeURIComponent(childId)}&parent=session-parent`,
+    `/side-chat/handoff?child=${encodeURIComponent(childId)}&parent=session-parent`,
   ])
   assert.equal(sink.drafts.length, 1)
   assert.equal(sink.drafts[0].binding, ctx.bindings['session-parent'])
   assert.equal(sink.drafts[0].options.clearPreviousDraft, false)
-  assert.match(sink.drafts[0].options.prompt, /^侧聊的结论：/)
-  assert.match(sink.drafts[0].options.prompt, /use a Map, not an array/)
-  assert.deepEqual(ctx.calls.prompt, [])
+  assert.equal(sink.drafts[0].options.prompt, '侧聊的结论：\n\n用 Map，不要用数组')
+  // The only prompt is the summary request to the side chat; the main line is never asked anything.
+  assert.deepEqual(
+    ctx.calls.prompt.map((call) => call.target),
+    [childId],
+  )
 })
 
-test('carry-back sends a message when the composer cannot take the draft', async () => {
+test('a composer that will not take the draft is reported, never routed around', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
   ctx.draftResult = 'preserved'
   ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
 
   const childId = await turnTail(ctx).inject('session-parent').run(3)
-  handoff = { status: 200, body: { ok: true, text: 'conclusion', turn: 0 } }
+  handoff = handoffThen('conclusion', '结论')
 
-  const result = await turnTail(ctx).inject(childId).run(0)
+  await assert.rejects(turnTail(ctx).inject(childId).run(0), /action.carryNoComposer/)
 
-  assert.equal(result, 'sent')
   assert.equal(sink.drafts.length, 1, 'the draft is still offered first')
-  assert.equal(ctx.calls.prompt.length, 1)
-  assert.equal(ctx.calls.prompt[0].target, 'session-parent')
-  assert.equal(ctx.calls.prompt[0].mode, 'queue')
-  assert.deepEqual(ctx.calls.prompt[0].content, [
-    { type: 'text', text: '侧聊的结论：\n\nconclusion' },
-  ])
+  // Nothing was sent to the main line: an unavailable composer is not an excuse
+  // to put words in the user's mouth.
+  assert.deepEqual(
+    ctx.calls.prompt.filter((call) => call.target === 'session-parent'),
+    [],
+  )
 })
 
 test('carry-back reports an empty side chat instead of drafting nothing', async () => {
@@ -654,13 +736,13 @@ test('an unreachable host route is reported as a status, not as a JSON error', a
   )
 })
 
-test('shift carry-back queues the conclusion as main-line context', async () => {
+test('shift carry-back queues the summary as main-line context', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
   ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
 
   const childId = await turnTail(ctx).inject('session-parent').run(3)
-  handoff = { status: 200, body: { ok: true, text: 'use a Map, not an array', turn: 2 } }
+  handoff = handoffThen('use a Map, not an array', '用 Map，不要用数组')
   context = { status: 200, body: { ok: true, sessionId: 'session-parent' } }
 
   const result = await turnTail(ctx).inject(childId).run(0, { inject: true })
@@ -675,27 +757,33 @@ test('shift carry-back queues the conclusion as main-line context', async () => 
   assert.equal(post.init.headers['X-Side-Chat'], '1')
   assert.deepEqual(JSON.parse(post.init.body), {
     sessionId: 'session-parent',
-    text: '侧聊的结论：\n\nuse a Map, not an array',
+    text: '侧聊的结论：\n\n用 Map，不要用数组',
     parent: childId,
   })
   assert.equal(sink.drafts.length, 0, 'context needs no composer')
-  assert.deepEqual(ctx.calls.prompt, [])
+  assert.deepEqual(
+    ctx.calls.prompt.filter((call) => call.target === 'session-parent'),
+    [],
+    'and it does not start a turn on the main line',
+  )
 })
 
-test('a cold main line falls back from context to the composer draft', async () => {
+test('a cold main line makes context carry fail instead of waking it', async () => {
   const { ctx } = await loadPlugin()
   const sink = installConversation(ctx)
   ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
 
   const childId = await turnTail(ctx).inject('session-parent').run(3)
-  handoff = { status: 200, body: { ok: true, text: 'conclusion', turn: 0 } }
+  handoff = handoffThen('conclusion', '结论')
   context = { status: 409, body: { ok: false, error: 'the session is not live; use the draft instead' } }
 
-  const result = await turnTail(ctx).inject(childId).run(0, { inject: true })
+  await assert.rejects(turnTail(ctx).inject(childId).run(0, { inject: true }), /not live/)
 
-  assert.equal(result, 'drafted')
-  assert.equal(sink.drafts.length, 1)
-  assert.match(sink.drafts[0].options.prompt, /conclusion/)
+  assert.equal(sink.drafts.length, 0, 'shift means context, not a silent change of carrier')
+  assert.deepEqual(
+    ctx.calls.prompt.filter((call) => call.target === 'session-parent'),
+    [],
+  )
 })
 
 test('the resource provider retains the child for the tab lifetime and releases it', async () => {
@@ -728,7 +816,7 @@ test('the resource provider retains the child for the tab lifetime and releases 
 
 test('an invalid address is rejected before anything is retained', async () => {
   const { ctx } = await loadPlugin()
-  const iterator = ctx.resources.open('dsh-resource://sidechat/session/x', {
+  const iterator = ctx.resources.open('dsh-resource://sidechat/session/x/extra', {
     signal: new AbortController().signal,
   })
   await assert.rejects(iterator.next(), /invalid side-chat address/)
@@ -746,47 +834,75 @@ test('a fresh side chat is renamed so its row can be told apart', async () => {
   assert.match(ctx.calls.rename[0].title, /\d{2}-\d{2} \d{2}:\d{2}$/)
 })
 
-test('closing a side chat asks, then archives it', async () => {
+test('closing a side chat asks in the sidebar, then archives it', async () => {
   const { ctx } = await loadPlugin()
-  const asks = []
-  globalThis.confirm = (question) => {
-    asks.push(question)
-    return true
-  }
-  try {
-    ctx.closeHandlers.sidechat('session-parent', {
-      id: 'tab-1',
-      navigation: {
-        address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7',
-      },
-    })
-    await settle()
+  ctx.closeHandlers.sidechat('session-parent', {
+    id: 'tab-1',
+    navigation: {
+      address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7',
+    },
+  })
 
-    assert.deepEqual(asks, ['close.archivePrompt'])
-    assert.deepEqual(ctx.calls.archive, [
-      { sessionId: 'session-child-1', options: { stopActivity: true } },
-    ])
-  } finally {
-    delete globalThis.confirm
-  }
+  const dialog = globalThis.document.body.children.find((element) => element.className === 'dsc-dialog')
+  assert.ok(dialog, 'the question belongs to the page, not to a blocking browser prompt')
+  assert.equal(dialog.attributes.role, 'dialog')
+  assert.equal(dialog.children[0].textContent, 'close.archiveTitle')
+  assert.deepEqual(
+    dialog.children[2].children.map((button) => button.textContent),
+    ['close.keep', 'close.archive'],
+  )
+
+  dialog.children[2].children[1].fire('click', {})
+  await settle()
+
+  assert.deepEqual(ctx.calls.archive, [
+    { sessionId: 'session-child-1', options: { stopActivity: true } },
+  ])
 })
 
 test('declining the archive question leaves the side chat listed', async () => {
   const { ctx } = await loadPlugin()
-  globalThis.confirm = () => false
-  try {
-    ctx.closeHandlers.sidechat('session-parent', {
-      id: 'tab-1',
-      navigation: {
-        address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7',
-      },
-    })
-    await settle()
+  ctx.closeHandlers.sidechat('session-parent', {
+    id: 'tab-1',
+    navigation: {
+      address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7',
+    },
+  })
 
-    assert.deepEqual(ctx.calls.archive, [])
-  } finally {
-    delete globalThis.confirm
-  }
+  const dialog = globalThis.document.body.children.find((element) => element.className === 'dsc-dialog')
+  dialog.children[2].children[0].fire('click', {})
+  await settle()
+
+  assert.deepEqual(ctx.calls.archive, [])
+})
+
+test('a second close replaces the question instead of stacking one on top', async () => {
+  const { ctx } = await loadPlugin()
+  const close = (childId) =>
+    ctx.closeHandlers.sidechat('session-parent', {
+      id: `tab-${childId}`,
+      navigation: { address: `dsh-resource://sidechat/session/${childId}?parent=session-parent` },
+    })
+
+  close('session-child-1')
+  close('session-child-2')
+  await settle()
+
+  const dialogs = globalThis.document.body.children.filter((element) => element.className === 'dsc-dialog')
+  const stale = dialogs.at(-2)
+  const live = dialogs.at(-1)
+
+  // The replaced card is inert: its buttons still exist, but the question is gone.
+  stale.children[2].children[1].fire('click', {})
+  await settle()
+  assert.deepEqual(ctx.calls.archive, [])
+
+  live.children[2].children[1].fire('click', {})
+  await settle()
+
+  assert.deepEqual(ctx.calls.archive, [
+    { sessionId: 'session-child-2', options: { stopActivity: true } },
+  ])
 })
 
 test('a fork this browser never opened still offers carry-back', async () => {
@@ -809,7 +925,7 @@ test('a subagent child does not offer carry-back', async () => {
   assert.equal(turnTail(ctx).inject('session-child-9').mode, 'open')
 })
 
-test('a composer that refuses its binding still carries the note as a message', async () => {
+test('a composer bound to an older generation is reported, not spoken over', async () => {
   const { ctx } = await loadPlugin()
   installConversation(ctx)
   ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
@@ -819,12 +935,14 @@ test('a composer that refuses its binding still carries the note as a message', 
   ctx.services.conversation.input.requestDraftInitialization = () => {
     throw new Error('binding belongs to a previous generation')
   }
-  handoff = { status: 200, body: { ok: true, text: 'conclusion', turn: 0 } }
+  handoff = handoffThen('conclusion', '结论')
 
   try {
-    const result = await turnTail(ctx).inject(childId).run(0)
-    assert.equal(result, 'sent')
-    assert.equal(ctx.calls.prompt.length, 1)
+    await assert.rejects(turnTail(ctx).inject(childId).run(0), /action.carryNoComposer/)
+    assert.deepEqual(
+      ctx.calls.prompt.filter((call) => call.target === 'session-parent'),
+      [],
+    )
   } finally {
     ctx.services.conversation.input.requestDraftInitialization = broken
   }
