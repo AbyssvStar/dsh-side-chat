@@ -173,12 +173,15 @@ function createContext() {
     prompt: [],
     tabsIn: [],
     focus: [],
+    rename: [],
+    archive: [],
   }
   const state = {
     calls,
     resources: undefined,
     tab: undefined,
     slots: [],
+    closeHandlers: {},
     dictionaries: undefined,
     styleMounted: false,
     services: {},
@@ -234,6 +237,15 @@ function createContext() {
       focus(tabId) {
         calls.focus.push(tabId)
       },
+      registerCloseHandler(kind, handler) {
+        state.closeHandlers[kind] = handler
+        return () => {}
+      },
+    },
+    uiWorkspace: {
+      async archiveSession(sessionId, options) {
+        calls.archive.push({ sessionId, options })
+      },
     },
     slots: {
       inject(name, factory) {
@@ -276,6 +288,10 @@ function createContext() {
               async prompt(content, mode) {
                 calls.prompt.push({ target, content, mode })
                 return state.promptResult
+              },
+              async rename(title) {
+                calls.rename.push({ sessionId: target, title })
+                return { ok: true, value: { title, seq: 1 } }
               },
             },
           },
@@ -341,6 +357,7 @@ test('registers one resource protocol, one tab kind, and one turn-footer entry',
     'conversation.chat.turnTail',
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab.title',
+    'sidebar.right.tab.guide.entry',
     'sidechat.conversation',
   ])
 
@@ -716,4 +733,99 @@ test('an invalid address is rejected before anything is retained', async () => {
   })
   await assert.rejects(iterator.next(), /invalid side-chat address/)
   assert.deepEqual(ctx.calls.retain, [])
+})
+
+test('a fresh side chat is renamed so its row can be told apart', async () => {
+  const { ctx } = await loadPlugin()
+
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+  await settle()
+
+  assert.equal(ctx.calls.rename.length, 1)
+  assert.equal(ctx.calls.rename[0].sessionId, childId)
+  assert.match(ctx.calls.rename[0].title, /\d{2}-\d{2} \d{2}:\d{2}$/)
+})
+
+test('closing a side chat asks, then archives it', async () => {
+  const { ctx } = await loadPlugin()
+  const asks = []
+  globalThis.confirm = (question) => {
+    asks.push(question)
+    return true
+  }
+  try {
+    ctx.closeHandlers.sidechat('session-parent', {
+      id: 'tab-1',
+      navigation: {
+        address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7',
+      },
+    })
+    await settle()
+
+    assert.deepEqual(asks, ['close.archivePrompt'])
+    assert.deepEqual(ctx.calls.archive, [
+      { sessionId: 'session-child-1', options: { stopActivity: true } },
+    ])
+  } finally {
+    delete globalThis.confirm
+  }
+})
+
+test('declining the archive question leaves the side chat listed', async () => {
+  const { ctx } = await loadPlugin()
+  globalThis.confirm = () => false
+  try {
+    ctx.closeHandlers.sidechat('session-parent', {
+      id: 'tab-1',
+      navigation: {
+        address: 'dsh-resource://sidechat/session/session-child-1?parent=session-parent&at=7',
+      },
+    })
+    await settle()
+
+    assert.deepEqual(ctx.calls.archive, [])
+  } finally {
+    delete globalThis.confirm
+  }
+})
+
+test('a fork this browser never opened still offers carry-back', async () => {
+  const { ctx } = await loadPlugin()
+  // No stored origin: the sideless path is a fork the built-in Branch command made.
+  ctx.summaries['session-child-9'] = { parentSessionId: 'session-parent', running: false }
+
+  assert.equal(turnTail(ctx).inject('session-child-9').mode, 'carry')
+  assert.equal(turnTail(ctx).inject('session-top').mode, 'open', 'a top-level line opens a side chat')
+})
+
+test('a subagent child does not offer carry-back', async () => {
+  const { ctx } = await loadPlugin()
+  ctx.summaries['session-child-9'] = {
+    parentSessionId: 'session-parent',
+    origin: 'subagent',
+    running: false,
+  }
+
+  assert.equal(turnTail(ctx).inject('session-child-9').mode, 'open')
+})
+
+test('a composer that refuses its binding still carries the note as a message', async () => {
+  const { ctx } = await loadPlugin()
+  installConversation(ctx)
+  ctx.bindings['session-parent'] = { sessionId: 'session-parent' }
+  const childId = await turnTail(ctx).inject('session-parent').run(3)
+
+  const broken = ctx.services.conversation.input.requestDraftInitialization
+  ctx.services.conversation.input.requestDraftInitialization = () => {
+    throw new Error('binding belongs to a previous generation')
+  }
+  handoff = { status: 200, body: { ok: true, text: 'conclusion', turn: 0 } }
+
+  try {
+    const result = await turnTail(ctx).inject(childId).run(0)
+    assert.equal(result, 'sent')
+    assert.equal(ctx.calls.prompt.length, 1)
+  } finally {
+    ctx.services.conversation.input.requestDraftInitialization = broken
+  }
 })
