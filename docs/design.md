@@ -1,10 +1,10 @@
-# 侧聊（Side Chat）插件设计文档
+# 侧聊（Side Chat）插件设计
 
 - 状态：draft v0.1
 - 日期：2026-10-28
-- 目标包名：`dsh-side-chat`（bundle id `side-chat`，type `plugin`）
+- 目标包名：`dsh-side-chat`
 - 宿主：DSH 0.2.1-rc.2 · Web GUI（`http://127.0.0.1:3080`）
-- 一句话：把 DSH 已有的 `session/fork` 重新宿主到右栏，并补上「选区引用」与「结论带回」两条通道。
+- 目标：把 DSH 已有的 `session/fork` 重新宿主到右栏，并补上「选区引用」与「结论带回」两条通道。
 
 ---
 
@@ -12,9 +12,8 @@
 
 1. **侧聊就是一条纯分支会话**：`session/fork` 在某个已完成 turn 的边界复制事件前缀，得到一个普通 session。没有新的会话类型、没有活共享、没有父子联动的日志。
 2. **隔离是结构性的**：主线之后的新消息不会进入侧聊，侧聊的消息也不会进入主线，两条侧聊之间除了「同一个工作目录 + 同一份额度」之外没有任何耦合。
-3. **带回是显式的、手动的、可编辑的**：结论由侧聊自己的模型在现场生成（或取原文），经预览确认后，以一条自定义事件追加到主线日志，模型能在下一轮看到，且**不伪造用户身份**。
-4. **选区引用是必需项**，不是可选项：它既是「就这段问」的入口，也是把代码/日志片段精确搬进侧聊输入框的方式。
-5. 本插件的真实价值不在「能开侧聊」，而在**低摩擦的分支判断**：并行对比、上下文裁剪、结论回收、以及让 agent 自己开侧聊。
+3. **带回是显式的、手动的、可编辑的**：结论由侧聊自己的模型在现场生成（或取原文），经预览确认后，以一条自定义事件追加到主线日志，模型能在下一轮看到。
+4. **选区引用是必需项**
 
 ---
 
@@ -44,8 +43,6 @@
 | 结论带回通道 | ❌ 无 | — |
 | 选区引用 | ⚠️ 有文件/文件夹/Session 引用 chip，无「选中文本引用」 | `dsh-client-ui-conversation` |
 | 自定义会话事件 → 卡片 | ✅ 可用 `registerMessageProjection` + Conversation Definition | `dsh-session` / `dsh-client-ui-conversation` |
-
-结论：**机制齐全，缺的是产品化的那一层**。
 
 ### 1.3 本文的取舍
 
@@ -149,9 +146,7 @@
 | 补丁片段 | 代码块，不自动写入文件 |
 | 一句话结论 | 「就用方案 2」 |
 
-### 3.3 选区引用（Codex 的 quote 等价物）
-
-要做，而且它同时是「入口」和「通道」。三个方向：
+### 3.3 选区引用
 
 | 方向 | 交互 | 实现 |
 | --- | --- | --- |
@@ -220,7 +215,7 @@ dsh-side-chat/
 └─ docs/design.md
 ```
 
-第三方插件契约（与 `dsh-whale-widget` / `dsh-ops` 一致）：
+第三方插件契约：
 
 - `dsh.bundle.patch` 指向 `./cordis.patch.yml`，patch 里 `- insert: [{ id, name, config }]` 插一行；
 - `dsh.client` 声明 `platform: "web"`、`inject` 列出依赖的 client 包、`external` 只加非基线请求；
@@ -469,92 +464,3 @@ MVP 合计约 3–4 人天（不含打磨与 i18n）。
 | 分叉点 | `atSeq`，通常是一个已完成 turn 的 closing seq |
 | 带回 | 把侧聊结论显式写入主线日志的动作 |
 | 引用 | 把一段选中文本带进另一侧输入框的动作 |
-
----
-
-## 附录 B：实现修订（以代码为准）
-
-初版设计里的两处假设在动手后被运行时否决，实现按下面的方式落地；本文正文
-保留原样，用来记录当时为什么那样想。
-
-### B.1 「带回」不再写自定义事件
-
-原计划把结论写成 `sidechat/result` 事件追加到主线日志尾部。**仓库外插件做不到
-这件事**：`session.append` 在内存里不校验类型，但 `dsh-session-persistence` 的
-`validateStoredEvents` 在回读时会拒绝整个日志（`unknown to this harness and not
-marked ignorable`）；`ignorable: true` 只能经 `appendPluginRecord` 写入，而
-README 明确禁止仓库外插件调用，且这类记录永不进入模型可见面。
-`registerMessageProjection` 受同一份已知类型表约束。
-
-现在的通道：host 半部提供只读路由 `GET /side-chat/handoff?child=<sessionId>`，
-经 `sessionPersistence` 读出该侧聊最后一条助手正文；客户端把它放进父会话的
-草稿（`requestDraftInitialization`）。副作用是「带回」不再有可渲染的专属卡片，
-改成草稿里的一段带标题文字。（草稿落不下去时的「降级发消息」后来也被删掉了，
-见 B.6。）
-
-### B.2 侧聊无法从会话列表隐藏
-
-`sessionVisible`（`dsh-client-ui-workspace`）只隐藏 `origin === 'subagent'` 与
-非当前的空会话；没有隐藏标志，也没有 `origin: 'fork'`。归档会让
-`ArchivedSessionGate` 拒绝后续每一个 `agent/pre-step`，会话就不能再跑了；
-把 origin 改成 subagent 则 `session/prompt` 一律 `session/agent-busy`，UI 还会
-换成只读输入框。用户已确认接受现状：侧聊以 `depth: 1` 缩进挂在父会话下面。
-
-### B.3 里程碑状态
-
-| 项 | 状态 |
-| --- | --- |
-| M1 从任意 turn 开侧聊 | 已实现（turn 尾部按钮，`atSeq` = closing seq） |
-| M2 右栏全功能 Chat | 已实现（`conversation.content` 的 embedded 变体） |
-| M3 侧聊身份 | 已实现（标题 + tab 类型 + 地址携带 `parent`/`at`） |
-| M4 带回 | 已实现（先由侧聊总结，再落草稿；不再降级发消息，见 B.6） |
-| M5 异步角标 | 已实现（标题座位跟随 `sessions.list`，运行中脉冲） |
-| M6 结束即归档 | 不实现（归档会让会话不可再跑，见 B.2） |
-| M7 选区引用 | 已实现：带回时只带选中文字；反方向用页面级 `↬` 悬浮按钮写进侧聊草稿（见 B.5） |
-
-### B.5 反方向引用为什么落在页面级按钮上
-
-选区是浏览器的全局事实，不属于某个会话，所以它不适合放在会话作用域的槽位里：
-`shell.overlay` 拿不到 `sessionId`，`conversation.chat.*` 又只覆盖聊天区域，够不到
-工具输出。实现改为在 `document.body` 上挂一个按钮，监听 `selectionchange` 自行定位。
-三条约束随之而来：选区锚点落在自己的面板内就隐藏（否则侧聊会引用它自己）；
-新建侧聊后 composer 尚未挂载，`requestDraftInitialization` 会返回 `blocked`，因此
-最多重试 10 次 ×150 ms；地址允许省略 `at`，因为"从选区开侧聊"没有分叉点。
-
-### B.4 仍然依赖未验证的假设
-
-- `sidebar.right.pane.tab.title` 的 `inject` 返回值会与标准 props 合并——与
-  `conversation.chat.turnTail` 的用法一致，但只在桩运行时里验证过。
-- `sessions.list` 的 `getSnapshot()` / `subscribe()` 形态取自内置包的用法。
-- 真实浏览器里的观感（按钮位置、草稿是否真的出现）尚未由人确认。
-
-### B.6 带回改成「先总结，再带回」，并且不再代你说话
-
-初版的带回有两处问题，都被指出来了：
-
-1. **整段搬运。** 侧聊最后一轮回答可能很长，还夹着过程、试错和工具输出；把它整段塞进
-   主线，等于让主线重新读一遍已经花掉的推理。现在点 `↩` 会先给侧聊发一条固定的总结
-   请求（`carry.summaryPrompt`），等它写完这一轮，再把**那一段总结**带回去。基线答案
-   在发请求前先读一次，轮询时要求「新答案 ≠ 基线」，否则会把旧答案当成总结；两分钟
-   没写完就退回旧答案并在控制台说明。
-2. **偷偷发消息。** 初版在草稿落不下去时（会话切走、页面刚重载、编辑器正忙）会退化成
-   `session.prompt(..., 'queue')`——那是真的发出一条用户消息、真的开始一个回合。这正是
-   「Shift 带回后主线自己动起来」的观感来源之一。现在这条降级链被删掉了：只落草稿，
-   落不下去就报错（`action.carryNoComposer`），由用户自己决定下一步。
-
-`inject` 这条背景通道本身不唤醒驱动：`dsh-agent-loop` 里
-`inject → send(input, 'next-step', false)`，类型注释写明 "without waking the driver"。
-所以「不要让主线自己动」只需要管住客户端，不需要改 host。
-
-### B.7 关闭询问与分栏入口
-
-- **关闭询问**：`window.confirm` 会阻塞整个页面、样式也不属于这个产品。改成页面内的
-  固定卡片（`.dsc-dialog`，`role="dialog"`，Escape 等于「留着」），由
-  `sidebarRight.registerCloseHandler` 在标签删除之后调用——它是同步的、无法取消关闭，
-  所以这张卡问的是「已经关掉的那个侧聊要不要顺手归档」，而不是关闭前的拦截。连续关闭
-  两个侧聊时后一张卡替换前一张，避免叠在一起问两件事。
-- **分栏入口**：guide 里现在有两条 capsule，`entryId` 分别是 `branch` 与 `blank`。
-  `branch` 走原来的 `sessions.fork`（不指定 `atSeq`，由 host 选最新完成的一轮）；
-  `blank` 走 `sessions.create({ cwd })`，开一个不带任何上下文的普通会话。空白侧聊的
-  地址省略 `parent`，因此 `originOf` 判定不出「来处」，带回按钮自然不出现——这是选择
-  而不是遗漏：没有主线可回。
